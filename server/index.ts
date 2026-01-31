@@ -1,11 +1,7 @@
-import { Hono } from "hono";
-import { serve } from "@hono/node-server";
-import { serveStatic } from "@hono/node-server/serve-static";
-import { getCookie, setCookie, deleteCookie } from "hono/cookie";
+import { Elysia } from "elysia";
+import { staticPlugin } from "@elysiajs/static";
 import { readFileSync, existsSync } from "fs";
 import { join } from "path";
-
-const app = new Hono();
 
 // Environment variables
 const config = {
@@ -26,220 +22,242 @@ const sessions = new Map<string, { accessToken: string; refreshToken: string }>(
 // Pending OAuth states (fallback for when cookies don't work through proxy)
 const pendingStates = new Set<string>();
 
-// Serve public key for Tesla partner registration
-app.get("/.well-known/appspecific/com.tesla.3p.public-key.pem", (c) => {
-  try {
-    const publicKey = readFileSync(
-      join(process.cwd(), ".well-known/appspecific/com.tesla.3p.public-key.pem"),
-      "utf-8"
-    );
-    return c.text(publicKey);
-  } catch {
-    return c.text("Public key not found", 404);
-  }
-});
+const app = new Elysia()
+  // Serve public key for Tesla partner registration
+  .get("/.well-known/appspecific/com.tesla.3p.public-key.pem", () => {
+    try {
+      const publicKey = readFileSync(
+        join(process.cwd(), ".well-known/appspecific/com.tesla.3p.public-key.pem"),
+        "utf-8"
+      );
+      return new Response(publicKey, {
+        headers: { "Content-Type": "text/plain" },
+      });
+    } catch {
+      return new Response("Public key not found", { status: 404 });
+    }
+  })
 
-// Auth: Start OAuth flow
-app.get("/auth/login", (c) => {
-  const state = crypto.randomUUID();
+  // Auth: Start OAuth flow
+  .get("/auth/login", ({ cookie, redirect }) => {
+    const state = crypto.randomUUID();
 
-  // Store state in memory as backup (cookies can be unreliable through proxies)
-  pendingStates.add(state);
-  setTimeout(() => pendingStates.delete(state), 10 * 60 * 1000); // 10 min expiry
+    // Store state in memory as backup (cookies can be unreliable through proxies)
+    pendingStates.add(state);
+    setTimeout(() => pendingStates.delete(state), 10 * 60 * 1000); // 10 min expiry
 
-  setCookie(c, "oauth_state", state, {
-    httpOnly: true,
-    secure: false, // Allow non-HTTPS for local dev
-    sameSite: "Lax",
-    path: "/",
-  });
+    cookie.oauth_state.set({
+      value: state,
+      httpOnly: true,
+      secure: false, // Allow non-HTTPS for local dev
+      sameSite: "lax",
+      path: "/",
+    });
 
-  const redirectUri = `${config.appUrl}/auth/callback`;
-  const authUrl = new URL(TESLA_AUTH_URL);
-  authUrl.searchParams.set("client_id", config.clientId);
-  authUrl.searchParams.set("redirect_uri", redirectUri);
-  authUrl.searchParams.set("response_type", "code");
-  authUrl.searchParams.set("scope", SCOPES);
-  authUrl.searchParams.set("state", state);
+    const redirectUri = `${config.appUrl}/auth/callback`;
+    const authUrl = new URL(TESLA_AUTH_URL);
+    authUrl.searchParams.set("client_id", config.clientId);
+    authUrl.searchParams.set("redirect_uri", redirectUri);
+    authUrl.searchParams.set("response_type", "code");
+    authUrl.searchParams.set("scope", SCOPES);
+    authUrl.searchParams.set("state", state);
 
-  console.log("Starting OAuth flow, redirect URI:", redirectUri);
-  return c.redirect(authUrl.toString());
-});
+    console.log("Starting OAuth flow, redirect URI:", redirectUri);
+    return redirect(authUrl.toString());
+  })
 
-// Auth: OAuth callback
-app.get("/auth/callback", async (c) => {
-  const code = c.req.query("code");
-  const state = c.req.query("state");
-  const storedState = getCookie(c, "oauth_state");
+  // Auth: OAuth callback
+  .get("/auth/callback", async ({ query, cookie, redirect }) => {
+    const code = query.code;
+    const state = query.state;
+    const storedState = cookie.oauth_state.value;
 
-  console.log("OAuth callback received");
-  console.log("State from URL:", state);
-  console.log("State from cookie:", storedState);
-  console.log("State in pending set:", state ? pendingStates.has(state) : false);
+    console.log("OAuth callback received");
+    console.log("State from URL:", state);
+    console.log("State from cookie:", storedState);
+    console.log("State in pending set:", state ? pendingStates.has(state) : false);
 
-  // Check state from cookie OR from pending states set (fallback)
-  const stateValid = state && (state === storedState || pendingStates.has(state));
+    // Check state from cookie OR from pending states set (fallback)
+    const stateValid = state && (state === storedState || pendingStates.has(state));
 
-  if (!code || !stateValid) {
-    console.error("Invalid state or missing code");
-    return c.redirect("/?error=invalid_state");
-  }
+    if (!code || !stateValid) {
+      console.error("Invalid state or missing code");
+      return redirect("/?error=invalid_state");
+    }
 
-  // Clean up the pending state
-  if (state) pendingStates.delete(state);
+    // Clean up the pending state
+    if (state) pendingStates.delete(state);
 
-  const redirectUri = `${config.appUrl}/auth/callback`;
+    const redirectUri = `${config.appUrl}/auth/callback`;
 
-  console.log("Exchanging code for tokens...");
-  const tokenResponse = await fetch(TESLA_TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type: "authorization_code",
-      client_id: config.clientId,
-      client_secret: config.clientSecret,
-      code,
-      redirect_uri: redirectUri,
-    }),
-  });
+    console.log("Exchanging code for tokens...");
+    const tokenResponse = await fetch(TESLA_TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: config.clientId,
+        client_secret: config.clientSecret,
+        code,
+        redirect_uri: redirectUri,
+      }),
+    });
 
-  if (!tokenResponse.ok) {
-    const error = await tokenResponse.text();
-    console.error("Token error:", error);
-    return c.redirect("/?error=token_error");
-  }
+    if (!tokenResponse.ok) {
+      const error = await tokenResponse.text();
+      console.error("Token error:", error);
+      return redirect("/?error=token_error");
+    }
 
-  const tokens = (await tokenResponse.json()) as { access_token: string; refresh_token: string };
-  console.log("Tokens received successfully");
+    const tokens = (await tokenResponse.json()) as { access_token: string; refresh_token: string };
+    console.log("Tokens received successfully");
 
-  const sessionId = crypto.randomUUID();
-  sessions.set(sessionId, {
-    accessToken: tokens.access_token,
-    refreshToken: tokens.refresh_token,
-  });
+    const sessionId = crypto.randomUUID();
+    sessions.set(sessionId, {
+      accessToken: tokens.access_token,
+      refreshToken: tokens.refresh_token,
+    });
 
-  setCookie(c, "session", sessionId, {
-    httpOnly: true,
-    secure: false,
-    sameSite: "Lax",
-    path: "/",
-    maxAge: 60 * 60 * 24 * 7, // 1 week
-  });
+    cookie.session.set({
+      value: sessionId,
+      httpOnly: true,
+      secure: false,
+      sameSite: "lax",
+      path: "/",
+      maxAge: 60 * 60 * 24 * 7, // 1 week
+    });
 
-  deleteCookie(c, "oauth_state");
-  return c.redirect("/");
-});
+    cookie.oauth_state.remove();
+    return redirect("/");
+  })
 
-// Auth: Check session
-app.get("/auth/session", (c) => {
-  const sessionId = getCookie(c, "session");
-  if (!sessionId || !sessions.has(sessionId)) {
-    return c.json({ authenticated: false });
-  }
-  return c.json({ authenticated: true });
-});
+  // Auth: Check session
+  .get("/auth/session", ({ cookie }) => {
+    const sessionId = cookie.session.value;
+    if (!sessionId || !sessions.has(sessionId)) {
+      return { authenticated: false };
+    }
+    return { authenticated: true };
+  })
 
-// Auth: Logout
-app.post("/auth/logout", (c) => {
-  const sessionId = getCookie(c, "session");
-  if (sessionId) {
-    sessions.delete(sessionId);
-    deleteCookie(c, "session");
-  }
-  return c.json({ success: true });
-});
+  // Auth: Logout
+  .post("/auth/logout", ({ cookie }) => {
+    const sessionId = cookie.session.value;
+    if (sessionId) {
+      sessions.delete(sessionId);
+      cookie.session.remove();
+    }
+    return { success: true };
+  })
 
-// Middleware to check auth for API routes
-const requireAuth = async (c: any, next: any) => {
-  const sessionId = getCookie(c, "session");
-  if (!sessionId || !sessions.has(sessionId)) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-  c.set("session", sessions.get(sessionId));
-  await next();
-};
+  // API routes with auth guard
+  .group("/api", (app) =>
+    app
+      // Derive session for all API routes
+      .derive(({ cookie, set }) => {
+        const sessionId = cookie.session.value;
+        if (!sessionId || !sessions.has(sessionId)) {
+          set.status = 401;
+          return { session: null, authError: true };
+        }
+        return { session: sessions.get(sessionId)!, authError: false };
+      })
+      // Guard to check auth before all API routes
+      .onBeforeHandle(({ authError }) => {
+        if (authError) {
+          return { error: "Unauthorized" };
+        }
+      })
 
-// API: Get vehicles
-app.get("/api/vehicles", requireAuth, async (c) => {
-  const session = c.get("session");
+      // API: Get vehicles
+      .get("/vehicles", async ({ session }) => {
+        console.log("Fetching vehicles from Tesla API...");
+        const response = await fetch(`${config.fleetApi}/api/1/vehicles`, {
+          headers: { Authorization: `Bearer ${session!.accessToken}` },
+        });
 
-  console.log("Fetching vehicles from Tesla API...");
-  const response = await fetch(`${config.fleetApi}/api/1/vehicles`, {
-    headers: { Authorization: `Bearer ${session.accessToken}` },
-  });
+        const data = await response.json();
+        console.log("Tesla API response status:", response.status);
+        console.log("Tesla API response:", JSON.stringify(data, null, 2));
 
-  const data = await response.json();
-  console.log("Tesla API response status:", response.status);
-  console.log("Tesla API response:", JSON.stringify(data, null, 2));
+        if (!response.ok) {
+          return new Response(
+            JSON.stringify({ error: "Failed to fetch vehicles", details: data }),
+            { status: response.status, headers: { "Content-Type": "application/json" } }
+          );
+        }
 
-  if (!response.ok) {
-    return c.json({ error: "Failed to fetch vehicles", details: data }, response.status);
-  }
+        return data;
+      })
 
-  return c.json(data);
-});
+      // API: Get vehicle data
+      .get("/vehicles/:id", async ({ session, params }) => {
+        const vehicleId = params.id;
 
-// API: Get vehicle data
-app.get("/api/vehicles/:id", requireAuth, async (c) => {
-  const session = c.get("session");
-  const vehicleId = c.req.param("id");
+        const response = await fetch(`${config.fleetApi}/api/1/vehicles/${vehicleId}/vehicle_data`, {
+          headers: { Authorization: `Bearer ${session!.accessToken}` },
+        });
 
-  const response = await fetch(`${config.fleetApi}/api/1/vehicles/${vehicleId}/vehicle_data`, {
-    headers: { Authorization: `Bearer ${session.accessToken}` },
-  });
+        if (!response.ok) {
+          return new Response(
+            JSON.stringify({ error: "Failed to fetch vehicle data" }),
+            { status: response.status, headers: { "Content-Type": "application/json" } }
+          );
+        }
 
-  if (!response.ok) {
-    return c.json({ error: "Failed to fetch vehicle data" }, response.status);
-  }
+        const data = await response.json();
+        return data;
+      })
 
-  const data = await response.json();
-  return c.json(data);
-});
+      // API: Get vehicle location
+      .get("/vehicles/:id/location", async ({ session, params }) => {
+        const vehicleId = params.id;
 
-// API: Get vehicle location
-app.get("/api/vehicles/:id/location", requireAuth, async (c) => {
-  const session = c.get("session");
-  const vehicleId = c.req.param("id");
+        const url = new URL(`${config.fleetApi}/api/1/vehicles/${vehicleId}/vehicle_data`);
+        url.searchParams.set("endpoints", "drive_state");
 
-  const url = new URL(`${config.fleetApi}/api/1/vehicles/${vehicleId}/vehicle_data`);
-  url.searchParams.set("endpoints", "drive_state");
+        const response = await fetch(url.toString(), {
+          headers: { Authorization: `Bearer ${session!.accessToken}` },
+        });
 
-  const response = await fetch(url.toString(), {
-    headers: { Authorization: `Bearer ${session.accessToken}` },
-  });
+        if (!response.ok) {
+          return new Response(
+            JSON.stringify({ error: "Failed to fetch location" }),
+            { status: response.status, headers: { "Content-Type": "application/json" } }
+          );
+        }
 
-  if (!response.ok) {
-    return c.json({ error: "Failed to fetch location" }, response.status);
-  }
+        const data = await response.json();
+        return data;
+      })
 
-  const data = await response.json();
-  return c.json(data);
-});
+      // API: Get charge state
+      .get("/vehicles/:id/charge", async ({ session, params }) => {
+        const vehicleId = params.id;
 
-// API: Get charge state
-app.get("/api/vehicles/:id/charge", requireAuth, async (c) => {
-  const session = c.get("session");
-  const vehicleId = c.req.param("id");
+        const url = new URL(`${config.fleetApi}/api/1/vehicles/${vehicleId}/vehicle_data`);
+        url.searchParams.set("endpoints", "charge_state");
 
-  const url = new URL(`${config.fleetApi}/api/1/vehicles/${vehicleId}/vehicle_data`);
-  url.searchParams.set("endpoints", "charge_state");
+        const response = await fetch(url.toString(), {
+          headers: { Authorization: `Bearer ${session!.accessToken}` },
+        });
 
-  const response = await fetch(url.toString(), {
-    headers: { Authorization: `Bearer ${session.accessToken}` },
-  });
+        if (!response.ok) {
+          return new Response(
+            JSON.stringify({ error: "Failed to fetch charge state" }),
+            { status: response.status, headers: { "Content-Type": "application/json" } }
+          );
+        }
 
-  if (!response.ok) {
-    return c.json({ error: "Failed to fetch charge state" }, response.status);
-  }
-
-  const data = await response.json();
-  return c.json(data);
-});
+        const data = await response.json();
+        return data;
+      })
+  );
 
 // Serve static files in production (only if build exists)
 const distPath = join(process.cwd(), "dist/client");
 if (existsSync(distPath)) {
-  app.use("/*", serveStatic({ root: "./dist/client" }));
+  app.use(staticPlugin({ assets: distPath, prefix: "/" }));
 }
 
 const port = 8080;
@@ -253,4 +271,4 @@ if (!existsSync(distPath)) {
 console.log(`\nMake sure ngrok is running: ngrok http ${port}`);
 console.log("=".repeat(60) + "\n");
 
-serve({ fetch: app.fetch, port });
+app.listen(port);
